@@ -1,0 +1,388 @@
+"""Training orchestration for all six methods.
+
+Reward (Eq. 7): r = A_after - A_before, the change in validation accuracy from
+updating the selected arm(s) for one epoch. Bandit statistics are updated with
+this reward (UCB Lines 14-15 / TS posterior update).
+"""
+
+import time
+from typing import Dict, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .bandit import UCB, GaussianThompsonSampling, build_random_arms, union_arms
+from .bandit.arms import Arm
+from .models import (build_model, wrap_paca, wrap_lora, freeze_backbone,
+                     get_head_parameters)
+from .sensitivity import compute_sensitivity, build_gradient_chains
+from .utils import AverageMeter, accuracy, set_seed, resolve_device, count_trainable
+
+
+# --------------------------------------------------------------------------- #
+# low-level train / eval
+# --------------------------------------------------------------------------- #
+def _build_optimizer(params, cfg):
+    return torch.optim.AdamW(params, lr=cfg.lr, betas=(cfg.beta1, cfg.beta2),
+                             weight_decay=cfg.weight_decay)
+
+
+def train_one_epoch(model, loader, optimizer, device, criterion, scaler=None, amp=False):
+    model.train()
+    meter = AverageMeter()
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        if amp and scaler is not None:
+            with torch.cuda.amp.autocast():
+                logits = model(images)
+                loss = criterion(logits, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(images)
+            loss = criterion(logits, targets)
+            loss.backward()
+            optimizer.step()
+        meter.update(loss.item(), images.size(0))
+    return meter.avg
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    meter = AverageMeter()
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        logits = model(images)
+        meter.update(accuracy(logits, targets), images.size(0))
+    return meter.avg
+
+
+# --------------------------------------------------------------------------- #
+# helpers shared by the PaCA-family
+# --------------------------------------------------------------------------- #
+def _random_columns(layer_in_features: Dict[str, int], rank: int, rng) -> Arm:
+    arm: Arm = {}
+    for name, in_f in layer_in_features.items():
+        r = min(rank, in_f)
+        arm[name] = [int(c) for c in rng.permutation(in_f)[:r]]
+    return arm
+
+
+def _make_optimizer_for(manager, model, cfg):
+    params = list(manager.trainable_parameters())
+    if cfg.train_head:
+        params += get_head_parameters(model)
+    return _build_optimizer(params, cfg)
+
+
+# --------------------------------------------------------------------------- #
+# main entry
+# --------------------------------------------------------------------------- #
+def run(cfg, loaders, num_classes, device, logger=print):
+    train_loader, val_loader, test_loader = loaders
+    criterion = nn.CrossEntropyLoss()
+    target_subs = [s.strip() for s in cfg.target_modules.split(",") if s.strip()]
+
+    set_seed(cfg.seed)
+    model = build_model(cfg.model, num_classes, cfg.image_size).to(device)
+
+    history: List[dict] = []
+    scaler = torch.cuda.amp.GradScaler() if (cfg.amp and device.type == "cuda") else None
+
+    total_timer_start = time.perf_counter()
+
+    if cfg.method == "lora":
+        _dispatch_lora(cfg, model, target_subs, train_loader, val_loader,
+                       device, criterion, scaler, history, logger)
+    else:
+        model, manager = wrap_paca(model, target_subs)
+        model.to(device)
+        freeze_backbone(model, train_head=cfg.train_head)
+
+        if cfg.method == "paca":
+            _dispatch_paca_fixed(cfg, model, manager, train_loader, val_loader,
+                                 device, criterion, scaler, history, logger)
+        elif cfg.method == "r_paca":
+            _dispatch_r_paca(cfg, model, manager, train_loader, val_loader,
+                             device, criterion, scaler, history, logger)
+        elif cfg.method in ("ucb_paca", "ts_paca"):
+            _dispatch_random_bandit(cfg, model, manager, train_loader, val_loader,
+                                    device, criterion, scaler, history, logger)
+        elif cfg.method == "gradient_paca":
+            _dispatch_gradient_paca(cfg, model, manager, train_loader, val_loader,
+                                    device, criterion, scaler, history, logger)
+        else:
+            raise ValueError(cfg.method)
+        manager.merge_all()  # persist learned columns before final test
+
+    total_time = time.perf_counter() - total_timer_start
+
+    test_acc = evaluate(model, test_loader, device)
+    best_val = max((h["val_after"] for h in history), default=0.0)
+    result = {
+        "method": cfg.method,
+        "dataset": cfg.dataset,
+        "total_epochs": len(history),
+        "total_training_time_sec": round(total_time, 2),
+        "best_val_accuracy": round(best_val * 100, 4),
+        "test_accuracy": round(test_acc * 100, 4),
+        "trainable_params": count_trainable(model),
+        "history": history,
+    }
+    logger(f"[done] method={cfg.method} dataset={cfg.dataset} "
+           f"epochs={len(history)} time={total_time:.1f}s test_acc={test_acc*100:.2f}%")
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# early-stopping wrapper
+# --------------------------------------------------------------------------- #
+class _EarlyStopper:
+    def __init__(self, patience: int):
+        self.patience = patience
+        self.best = -1.0
+        self.bad = 0
+
+    def step(self, value: float) -> bool:
+        """Return True if training should stop."""
+        if self.patience <= 0:
+            return False
+        if value > self.best + 1e-6:
+            self.best = value
+            self.bad = 0
+        else:
+            self.bad += 1
+        return self.bad >= self.patience
+
+
+# --------------------------------------------------------------------------- #
+# method dispatchers
+# --------------------------------------------------------------------------- #
+def _dispatch_lora(cfg, model, target_subs, train_loader, val_loader,
+                   device, criterion, scaler, history, logger):
+    model = wrap_lora(model, target_subs, cfg.lora_rank, cfg.lora_alpha)
+    model.to(device)
+    freeze_backbone(model, train_head=cfg.train_head)
+    # unfreeze LoRA params
+    for name, p in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            p.requires_grad_(True)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = _build_optimizer(params, cfg)
+    stopper = _EarlyStopper(cfg.patience)
+    for epoch in range(cfg.epochs):
+        val_before = evaluate(model, val_loader, device)
+        loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
+                               scaler, cfg.amp)
+        val_after = evaluate(model, val_loader, device)
+        history.append(_record(epoch, None, loss, val_before, val_after))
+        logger(_fmt(epoch, "-", loss, val_before, val_after))
+        if stopper.step(val_after):
+            logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
+            break
+
+
+def _dispatch_paca_fixed(cfg, model, manager, train_loader, val_loader,
+                         device, criterion, scaler, history, logger):
+    rng = np.random.default_rng(cfg.seed)
+    arm = _random_columns(manager.layer_in_features(), cfg.rank, rng)
+    manager.activate(arm)
+    optimizer = _make_optimizer_for(manager, model, cfg)  # fixed selection -> one optimizer
+    stopper = _EarlyStopper(cfg.patience)
+    for epoch in range(cfg.epochs):
+        val_before = evaluate(model, val_loader, device)
+        loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
+                               scaler, cfg.amp)
+        val_after = evaluate(model, val_loader, device)
+        history.append(_record(epoch, None, loss, val_before, val_after))
+        logger(_fmt(epoch, "fixed", loss, val_before, val_after))
+        if stopper.step(val_after):
+            logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
+            break
+
+
+def _dispatch_r_paca(cfg, model, manager, train_loader, val_loader,
+                     device, criterion, scaler, history, logger):
+    rng = np.random.default_rng(cfg.seed)
+    stopper = _EarlyStopper(cfg.patience)
+    for epoch in range(cfg.epochs):
+        arm = _random_columns(manager.layer_in_features(), cfg.rank, rng)
+        manager.activate(arm)                      # new random subset each epoch
+        optimizer = _make_optimizer_for(manager, model, cfg)
+        val_before = evaluate(model, val_loader, device)
+        loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
+                               scaler, cfg.amp)
+        val_after = evaluate(model, val_loader, device)
+        history.append(_record(epoch, None, loss, val_before, val_after))
+        logger(_fmt(epoch, "random", loss, val_before, val_after))
+        if stopper.step(val_after):
+            logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
+            break
+
+
+def _dispatch_random_bandit(cfg, model, manager, train_loader, val_loader,
+                            device, criterion, scaler, history, logger):
+    rng = np.random.default_rng(cfg.seed)
+    arms = build_random_arms(manager.layer_in_features(), cfg.num_arms, cfg.rank, rng)
+
+    if cfg.method == "ucb_paca":
+        bandit = UCB(cfg.num_arms, alpha=cfg.ucb_alpha)
+        select_size = cfg.select_size
+    else:  # ts_paca
+        bandit = GaussianThompsonSampling(
+            cfg.num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
+            sigma_obs=cfg.ts_sigma_obs, rng=np.random.default_rng(cfg.seed + 1))
+        select_size = cfg.select_size
+
+    _bandit_loop(cfg, model, manager, arms, bandit, select_size,
+                 train_loader, val_loader, device, criterion, scaler, history, logger)
+
+
+def _dispatch_gradient_paca(cfg, model, manager, train_loader, val_loader,
+                            device, criterion, scaler, history, logger):
+    rng = np.random.default_rng(cfg.seed)
+
+    # ---- warm start: train a broad random adapter set for a few epochs ------
+    warm_arm = _random_columns(manager.layer_in_features(),
+                               cfg.rank * cfg.num_arms, rng)
+    manager.activate(warm_arm)
+    optimizer = _make_optimizer_for(manager, model, cfg)
+    for epoch in range(cfg.warmup_epochs):
+        val_before = evaluate(model, val_loader, device)
+        loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
+                               scaler, cfg.amp)
+        val_after = evaluate(model, val_loader, device)
+        history.append(_record(epoch, "warmup", loss, val_before, val_after))
+        logger(_fmt(epoch, "warmup", loss, val_before, val_after))
+    manager.merge_all()  # persist warm-start updates into the frozen weights
+
+    # ---- sensitivity analysis + chain construction --------------------------
+    sens = compute_sensitivity(model, manager, train_loader, device,
+                               num_batches=cfg.sens_batches)
+    layer_order = manager.layer_names  # depth order preserved during wrapping
+    arms = build_gradient_chains(sens, layer_order, cfg.num_arms, cfg.chain_width)
+    logger(f"[gradient] built {len(arms)} gradient-aligned chain arms.")
+
+    # ---- Thompson Sampling over chain arms (paper reports TS for gradient) ---
+    bandit = GaussianThompsonSampling(
+        cfg.num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
+        sigma_obs=cfg.ts_sigma_obs, rng=np.random.default_rng(cfg.seed + 2))
+    _bandit_loop(cfg, model, manager, arms, bandit, cfg.select_size,
+                 train_loader, val_loader, device, criterion, scaler, history, logger,
+                 start_epoch=cfg.warmup_epochs)
+
+
+def _bandit_loop(cfg, model, manager, arms, bandit, select_size,
+                 train_loader, val_loader, device, criterion, scaler, history, logger,
+                 start_epoch=0):
+    stopper = _EarlyStopper(cfg.patience)
+    remaining = cfg.epochs - start_epoch
+    for step in range(remaining):
+        epoch = start_epoch + step
+        selected = bandit.select(select_size)          # arm indices this epoch
+        cols = union_arms(arms, selected)              # union of their columns
+        manager.activate(cols)
+        optimizer = _make_optimizer_for(manager, model, cfg)
+
+        val_before = evaluate(model, val_loader, device)
+        loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
+                               scaler, cfg.amp)
+        val_after = evaluate(model, val_loader, device)
+
+        reward = val_after - val_before                # Eq. 7
+        bandit.update(selected, reward)
+
+        history.append(_record(epoch, selected, loss, val_before, val_after, reward))
+        logger(_fmt(epoch, selected, loss, val_before, val_after, reward))
+        if stopper.step(val_after):
+            logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
+            break
+
+
+# --------------------------------------------------------------------------- #
+# logging records
+# --------------------------------------------------------------------------- #
+def _record(epoch, selected, loss, val_before, val_after, reward=None):
+    rec = {
+        "epoch": epoch,
+        "arm": (selected if isinstance(selected, (list, type(None))) else str(selected)),
+        "train_loss": round(float(loss), 4),
+        "val_before": round(float(val_before), 4),
+        "val_after": round(float(val_after), 4),
+    }
+    if reward is not None:
+        rec["reward"] = round(float(reward), 4)
+    return rec
+
+
+def _fmt(epoch, arm, loss, vb, va, reward=None):
+    base = (f"[epoch {epoch:>3}] arm={arm} loss={loss:.4f} "
+            f"val {vb*100:.2f}->{va*100:.2f}%")
+    if reward is not None:
+        base += f" reward={reward*100:+.2f}"
+    return base
+
+
+# --------------------------------------------------------------------------- #
+# throughput benchmark
+# --------------------------------------------------------------------------- #
+def benchmark_throughput(cfg, num_classes, device, logger=print):
+    """Measure training throughput (images/sec) for several batch sizes."""
+    criterion = nn.CrossEntropyLoss()
+    target_subs = [s.strip() for s in cfg.target_modules.split(",") if s.strip()]
+    batch_sizes = [int(b) for b in cfg.throughput_batch_sizes.split(",") if b.strip()]
+
+    set_seed(cfg.seed)
+    model = build_model(cfg.model, num_classes, cfg.image_size).to(device)
+
+    if cfg.method == "lora":
+        model = wrap_lora(model, target_subs, cfg.lora_rank, cfg.lora_alpha).to(device)
+        freeze_backbone(model, train_head=cfg.train_head)
+        for name, p in model.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                p.requires_grad_(True)
+        params = [p for p in model.parameters() if p.requires_grad]
+    else:
+        model, manager = wrap_paca(model, target_subs)
+        model.to(device)
+        freeze_backbone(model, train_head=cfg.train_head)
+        rng = np.random.default_rng(cfg.seed)
+        arm = _random_columns(manager.layer_in_features(), cfg.rank, rng)
+        manager.activate(arm)
+        params = list(manager.trainable_parameters())
+        if cfg.train_head:
+            params += get_head_parameters(model)
+
+    optimizer = _build_optimizer(params, cfg)
+
+    results = {}
+    for bs in batch_sizes:
+        images = torch.randn(bs, 3, cfg.image_size, cfg.image_size, device=device)
+        targets = torch.randint(0, num_classes, (bs,), device=device)
+        # warmup
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(images), targets)
+            loss.backward()
+            optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(cfg.throughput_iters):
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(images), targets)
+            loss.backward()
+            optimizer.step()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        ips = cfg.throughput_iters * bs / dt
+        results[bs] = round(ips, 2)
+        logger(f"[throughput] method={cfg.method} bs={bs} -> {ips:.2f} images/sec")
+    return {"method": cfg.method, "throughput_images_per_sec": results}
