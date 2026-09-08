@@ -78,21 +78,55 @@ def _stratified_split(labels, frac: float, seed: int):
     return idx_a, idx_b
 
 
+def _stratified_subsample(indices, labels, n_keep: int, seed: int):
+    """Keep ``n_keep`` of ``indices`` with class proportions preserved.
+
+    ``labels`` are the labels aligned with ``indices`` (same order). Allocation
+    is proportional to class frequency with largest-remainder rounding so the
+    total lands exactly on ``n_keep`` (subject to per-class availability). The
+    choice is deterministic given ``seed``.
+    """
+    indices = np.asarray(indices)
+    labels = np.asarray(labels)
+    if n_keep >= len(indices):
+        return indices.tolist()
+    rng = np.random.default_rng(seed + 12345)
+    classes = np.unique(labels)
+    counts = {int(c): int(np.sum(labels == c)) for c in classes}
+    total = len(indices)
+    raw = {c: n_keep * counts[c] / total for c in counts}
+    alloc = {c: int(np.floor(v)) for c, v in raw.items()}
+    remainder = n_keep - sum(alloc.values())
+    # hand out the remaining slots to the largest fractional parts
+    for c in sorted(counts, key=lambda c: raw[c] - alloc[c], reverse=True)[:remainder]:
+        alloc[c] += 1
+    keep = []
+    for c in counts:
+        pool = indices[labels == c]
+        rng.shuffle(pool)
+        keep.extend(pool[:min(alloc[c], len(pool))].tolist())
+    rng.shuffle(keep)
+    return keep
+
+
 # --------------------------------------------------------------------------- #
-# per-dataset raw builders (return PIL-image datasets, no tensor transform yet)
+# per-dataset raw builders
+# Each returns (train_raw, test_raw, num_classes, train_labels) where
+# train_labels is a python list aligned with train_raw's indexing. The labels
+# are used for class-stratified subsampling without loading any image tensors.
 # --------------------------------------------------------------------------- #
 def _build_cifar100(root):
     from torchvision.datasets import CIFAR100
     train = CIFAR100(root=root, train=True, download=False)
     test = CIFAR100(root=root, train=False, download=False)
-    return train, test, 100
+    return train, test, 100, [int(t) for t in train.targets]
 
 
 def _build_svhn(root):
     from torchvision.datasets import SVHN
     train = SVHN(root=root, split="train", download=False)
     test = SVHN(root=root, split="test", download=False)
-    return train, test, 10
+    return train, test, 10, [int(t) for t in train.labels]
 
 
 def _build_flowers102(root, seed):
@@ -106,7 +140,7 @@ def _build_flowers102(root, seed):
     train_idx, test_idx = _stratified_split(labels, frac=0.2, seed=seed)
     train = Subset(pool, train_idx)
     test = Subset(pool, test_idx)
-    return train, test, 102
+    return train, test, 102, [int(labels[j]) for j in train_idx]
 
 
 def _build_caltech101(root, seed):
@@ -116,7 +150,61 @@ def _build_caltech101(root, seed):
     train_idx, test_idx = _stratified_split(labels, frac=0.2, seed=seed)
     train = Subset(full, train_idx)
     test = Subset(full, test_idx)
-    return train, test, 101
+    return train, test, 101, [int(labels[j]) for j in train_idx]
+
+
+def _build_dtd(root):
+    """Describable Textures (47 classes) -- official splits (partition 1).
+
+    Textures are a genuine domain shift from ImageNet objects, so this stays
+    non-saturated. Train uses the official train+val (~3760 images)."""
+    from torchvision.datasets import DTD
+    train = DTD(root=root, split="train", partition=1, download=False)
+    val = DTD(root=root, split="val", partition=1, download=False)
+    test = DTD(root=root, split="test", partition=1, download=False)
+    pool = ConcatDataset([train, val])
+    train_labels = [int(x) for x in list(train._labels) + list(val._labels)]
+    return pool, test, 47, train_labels
+
+
+def _build_fgvc_aircraft(root):
+    """FGVC-Aircraft (100 variants) -- official trainval / test splits.
+
+    Fine-grained and considerably harder than Flowers/Pets for an ImageNet
+    backbone."""
+    from torchvision.datasets import FGVCAircraft
+    train = FGVCAircraft(root=root, split="trainval",
+                         annotation_level="variant", download=False)
+    test = FGVCAircraft(root=root, split="test",
+                        annotation_level="variant", download=False)
+    return train, test, 100, [int(x) for x in train._labels]
+
+
+def _build_eurosat(root, seed):
+    """EuroSAT (10 classes, 27k satellite tiles) -- stratified 80/20 split.
+
+    Overhead RGB imagery is a large domain shift from ImageNet."""
+    from torchvision.datasets import EuroSAT
+    full = EuroSAT(root=root, download=False)  # ImageFolder subclass -> .targets
+    labels = np.asarray(full.targets)
+    train_idx, test_idx = _stratified_split(labels, frac=0.2, seed=seed)
+    train = Subset(full, train_idx)
+    test = Subset(full, test_idx)
+    return train, test, 10, [int(labels[j]) for j in train_idx]
+
+
+def _build_sun397(root, seed):
+    """SUN397 (397 scene classes) -- stratified 80/20 split.
+
+    A large scene-recognition task; a lighter, in-genre alternative to
+    Places365. NOTE: the download is large (~38 GB)."""
+    from torchvision.datasets import SUN397
+    full = SUN397(root=root, download=False)
+    labels = np.asarray(full._labels)
+    train_idx, test_idx = _stratified_split(labels, frac=0.2, seed=seed)
+    train = Subset(full, train_idx)
+    test = Subset(full, test_idx)
+    return train, test, 397, [int(labels[j]) for j in train_idx]
 
 
 class FakeImageDataset(Dataset):
@@ -137,17 +225,31 @@ class FakeImageDataset(Dataset):
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
-def build_datasets(name: str, root: str, image_size: int, val_frac: float, seed: int):
-    """Return (train_ds, val_ds, test_ds, num_classes) ready for DataLoaders."""
+def build_datasets(name: str, root: str, image_size: int, val_frac: float, seed: int,
+                   max_train_samples: int = 0):
+    """Return (train_ds, val_ds, test_ds, num_classes) ready for DataLoaders.
+
+    If ``max_train_samples > 0`` the *training* split is capped with a
+    class-stratified subsample; the validation hold-out and test set are left
+    untouched so results stay comparable across budgets.
+    """
     ds_root = os.path.join(root, name)  # matches download_data.py layout
     if name == "cifar100":
-        raw_train, raw_test, num_classes = _build_cifar100(ds_root)
+        raw_train, raw_test, num_classes, train_labels = _build_cifar100(ds_root)
     elif name == "svhn":
-        raw_train, raw_test, num_classes = _build_svhn(ds_root)
+        raw_train, raw_test, num_classes, train_labels = _build_svhn(ds_root)
     elif name == "flowers102":
-        raw_train, raw_test, num_classes = _build_flowers102(ds_root, seed)
+        raw_train, raw_test, num_classes, train_labels = _build_flowers102(ds_root, seed)
     elif name == "caltech101":
-        raw_train, raw_test, num_classes = _build_caltech101(ds_root, seed)
+        raw_train, raw_test, num_classes, train_labels = _build_caltech101(ds_root, seed)
+    elif name == "dtd":
+        raw_train, raw_test, num_classes, train_labels = _build_dtd(ds_root)
+    elif name == "fgvc_aircraft":
+        raw_train, raw_test, num_classes, train_labels = _build_fgvc_aircraft(ds_root)
+    elif name == "eurosat":
+        raw_train, raw_test, num_classes, train_labels = _build_eurosat(ds_root, seed)
+    elif name == "sun397":
+        raw_train, raw_test, num_classes, train_labels = _build_sun397(ds_root, seed)
     else:
         raise ValueError(f"Unknown dataset '{name}'.")
 
@@ -157,13 +259,21 @@ def build_datasets(name: str, root: str, image_size: int, val_frac: float, seed:
     full_train = _RGB(raw_train, train_tf)
     test_ds = _RGB(raw_test, eval_tf)
 
-    # validation hold-out carved from train
+    # validation hold-out carved from train (seed-stable, independent of any cap)
     n = len(full_train)
+    train_labels = np.asarray(train_labels)
+    if len(train_labels) != n:  # safety: fall back to non-stratified cap
+        train_labels = np.zeros(n, dtype=np.int64)
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n)
     n_val = int(round(n * val_frac))
     val_idx = perm[:n_val].tolist()
     train_idx = perm[n_val:].tolist()
+
+    # optional class-stratified cap on TRAIN ONLY (val held stable)
+    if max_train_samples and max_train_samples > 0 and max_train_samples < len(train_idx):
+        train_idx = _stratified_subsample(train_idx, train_labels[train_idx],
+                                          max_train_samples, seed)
 
     # validation should use eval transforms -> build a separate RGB view
     val_view = _RGB(raw_train, eval_tf)

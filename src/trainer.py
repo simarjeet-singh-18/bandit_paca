@@ -95,11 +95,15 @@ def run(cfg, loaders, num_classes, device, logger=print):
     history: List[dict] = []
     scaler = torch.cuda.amp.GradScaler() if (cfg.amp and device.type == "cuda") else None
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
     total_timer_start = time.perf_counter()
 
     if cfg.method == "lora":
         _dispatch_lora(cfg, model, target_subs, train_loader, val_loader,
                        device, criterion, scaler, history, logger)
+        trainable = count_trainable(model)          # LoRA adapters + head (still active)
     else:
         model, manager = wrap_paca(model, target_subs)
         model.to(device)
@@ -119,12 +123,26 @@ def run(cfg, loaders, num_classes, device, logger=print):
                                     device, criterion, scaler, history, logger)
         else:
             raise ValueError(cfg.method)
+        # Count trainable params while the last arm's deltas are still active;
+        # merge_all() below sets them to None, which would otherwise hide the
+        # adapter budget and report only the head.
+        trainable = count_trainable(model)
         manager.merge_all()  # persist learned columns before final test
 
     total_time = time.perf_counter() - total_timer_start
 
+    total_params = (sum(p.numel() for p in model.parameters())
+                    + sum(b.numel() for b in model.buffers()))
+    trainable_pct = 100.0 * trainable / max(total_params, 1)
+
     test_acc = evaluate(model, test_loader, device)
     best_val = max((h["val_after"] for h in history), default=0.0)
+
+    if device.type == "cuda":
+        peak_mem_mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 1)
+    else:
+        peak_mem_mb = None
+
     result = {
         "method": cfg.method,
         "dataset": cfg.dataset,
@@ -132,9 +150,16 @@ def run(cfg, loaders, num_classes, device, logger=print):
         "total_training_time_sec": round(total_time, 2),
         "best_val_accuracy": round(best_val * 100, 4),
         "test_accuracy": round(test_acc * 100, 4),
-        "trainable_params": count_trainable(model),
+        "trainable_params": trainable,
+        "total_params": total_params,
+        "trainable_params_pct": round(trainable_pct, 4),
+        "peak_gpu_mem_mb": peak_mem_mb,
         "history": history,
     }
+    logger(f"[params] trainable={trainable:,} "
+           f"({trainable_pct:.3f}% of {total_params:,} total)")
+    if peak_mem_mb is not None:
+        logger(f"[gpu] peak memory allocated = {peak_mem_mb:.1f} MB")
     logger(f"[done] method={cfg.method} dataset={cfg.dataset} "
            f"epochs={len(history)} time={total_time:.1f}s test_acc={test_acc*100:.2f}%")
     return result
@@ -176,13 +201,14 @@ def _dispatch_lora(cfg, model, target_subs, train_loader, val_loader,
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = _build_optimizer(params, cfg)
     stopper = _EarlyStopper(cfg.patience)
+    prev_val = evaluate(model, val_loader, device)  # baseline once; reuse thereafter
     for epoch in range(cfg.epochs):
-        val_before = evaluate(model, val_loader, device)
         loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
                                scaler, cfg.amp)
         val_after = evaluate(model, val_loader, device)
-        history.append(_record(epoch, None, loss, val_before, val_after))
-        logger(_fmt(epoch, "-", loss, val_before, val_after))
+        history.append(_record(epoch, None, loss, prev_val, val_after))
+        logger(_fmt(epoch, "-", loss, prev_val, val_after))
+        prev_val = val_after
         if stopper.step(val_after):
             logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
             break
@@ -195,13 +221,14 @@ def _dispatch_paca_fixed(cfg, model, manager, train_loader, val_loader,
     manager.activate(arm)
     optimizer = _make_optimizer_for(manager, model, cfg)  # fixed selection -> one optimizer
     stopper = _EarlyStopper(cfg.patience)
+    prev_val = evaluate(model, val_loader, device)  # baseline once; reuse thereafter
     for epoch in range(cfg.epochs):
-        val_before = evaluate(model, val_loader, device)
         loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
                                scaler, cfg.amp)
         val_after = evaluate(model, val_loader, device)
-        history.append(_record(epoch, None, loss, val_before, val_after))
-        logger(_fmt(epoch, "fixed", loss, val_before, val_after))
+        history.append(_record(epoch, None, loss, prev_val, val_after))
+        logger(_fmt(epoch, "fixed", loss, prev_val, val_after))
+        prev_val = val_after
         if stopper.step(val_after):
             logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
             break
@@ -211,16 +238,17 @@ def _dispatch_r_paca(cfg, model, manager, train_loader, val_loader,
                      device, criterion, scaler, history, logger):
     rng = np.random.default_rng(cfg.seed)
     stopper = _EarlyStopper(cfg.patience)
+    prev_val = evaluate(model, val_loader, device)  # baseline once; reuse thereafter
     for epoch in range(cfg.epochs):
         arm = _random_columns(manager.layer_in_features(), cfg.rank, rng)
         manager.activate(arm)                      # new random subset each epoch
         optimizer = _make_optimizer_for(manager, model, cfg)
-        val_before = evaluate(model, val_loader, device)
         loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
                                scaler, cfg.amp)
         val_after = evaluate(model, val_loader, device)
-        history.append(_record(epoch, None, loss, val_before, val_after))
-        logger(_fmt(epoch, "random", loss, val_before, val_after))
+        history.append(_record(epoch, None, loss, prev_val, val_after))
+        logger(_fmt(epoch, "random", loss, prev_val, val_after))
+        prev_val = val_after
         if stopper.step(val_after):
             logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
             break
@@ -253,13 +281,14 @@ def _dispatch_gradient_paca(cfg, model, manager, train_loader, val_loader,
                                cfg.rank * cfg.num_arms, rng)
     manager.activate(warm_arm)
     optimizer = _make_optimizer_for(manager, model, cfg)
+    prev_val = evaluate(model, val_loader, device)  # baseline once; reuse thereafter
     for epoch in range(cfg.warmup_epochs):
-        val_before = evaluate(model, val_loader, device)
         loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
                                scaler, cfg.amp)
         val_after = evaluate(model, val_loader, device)
-        history.append(_record(epoch, "warmup", loss, val_before, val_after))
-        logger(_fmt(epoch, "warmup", loss, val_before, val_after))
+        history.append(_record(epoch, "warmup", loss, prev_val, val_after))
+        logger(_fmt(epoch, "warmup", loss, prev_val, val_after))
+        prev_val = val_after
     manager.merge_all()  # persist warm-start updates into the frozen weights
 
     # ---- sensitivity analysis + chain construction --------------------------
@@ -283,6 +312,11 @@ def _bandit_loop(cfg, model, manager, arms, bandit, select_size,
                  start_epoch=0):
     stopper = _EarlyStopper(cfg.patience)
     remaining = cfg.epochs - start_epoch
+    # Re-selecting an arm never changes the model's output (delta is re-init'd so
+    # the correction starts at zero), so the previous epoch's post-training
+    # accuracy IS this epoch's A_before. Evaluate the baseline once, then reuse
+    # each epoch's val_after as the next epoch's "before" -> one eval per epoch.
+    prev_val = evaluate(model, val_loader, device)
     for step in range(remaining):
         epoch = start_epoch + step
         selected = bandit.select(select_size)          # arm indices this epoch
@@ -290,16 +324,16 @@ def _bandit_loop(cfg, model, manager, arms, bandit, select_size,
         manager.activate(cols)
         optimizer = _make_optimizer_for(manager, model, cfg)
 
-        val_before = evaluate(model, val_loader, device)
         loss = train_one_epoch(model, train_loader, optimizer, device, criterion,
                                scaler, cfg.amp)
         val_after = evaluate(model, val_loader, device)
 
-        reward = val_after - val_before                # Eq. 7
+        reward = val_after - prev_val                  # Eq. 7 (A_after - A_before)
         bandit.update(selected, reward)
 
-        history.append(_record(epoch, selected, loss, val_before, val_after, reward))
-        logger(_fmt(epoch, selected, loss, val_before, val_after, reward))
+        history.append(_record(epoch, selected, loss, prev_val, val_after, reward))
+        logger(_fmt(epoch, selected, loss, prev_val, val_after, reward))
+        prev_val = val_after                           # next epoch's A_before
         if stopper.step(val_after):
             logger(f"[early-stop] no val improvement for {cfg.patience} epochs.")
             break
@@ -361,7 +395,14 @@ def benchmark_throughput(cfg, num_classes, device, logger=print):
 
     optimizer = _build_optimizer(params, cfg)
 
+    trainable = count_trainable(model)
+    total_params = (sum(p.numel() for p in model.parameters())
+                    + sum(b.numel() for b in model.buffers()))
+    logger(f"[params] trainable={trainable:,} "
+           f"({100.0 * trainable / max(total_params, 1):.3f}% of {total_params:,} total)")
+
     results = {}
+    peak_mem = {}
     for bs in batch_sizes:
         images = torch.randn(bs, 3, cfg.image_size, cfg.image_size, device=device)
         targets = torch.randint(0, num_classes, (bs,), device=device)
@@ -373,6 +414,7 @@ def benchmark_throughput(cfg, num_classes, device, logger=print):
             optimizer.step()
         if device.type == "cuda":
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         for _ in range(cfg.throughput_iters):
             optimizer.zero_grad(set_to_none=True)
@@ -384,5 +426,18 @@ def benchmark_throughput(cfg, num_classes, device, logger=print):
         dt = time.perf_counter() - t0
         ips = cfg.throughput_iters * bs / dt
         results[bs] = round(ips, 2)
-        logger(f"[throughput] method={cfg.method} bs={bs} -> {ips:.2f} images/sec")
-    return {"method": cfg.method, "throughput_images_per_sec": results}
+        if device.type == "cuda":
+            mb = round(torch.cuda.max_memory_allocated(device) / (1024 ** 2), 1)
+            peak_mem[bs] = mb
+            logger(f"[throughput] method={cfg.method} bs={bs} -> {ips:.2f} images/sec "
+                   f"(peak {mb:.1f} MB)")
+        else:
+            logger(f"[throughput] method={cfg.method} bs={bs} -> {ips:.2f} images/sec")
+    return {
+        "method": cfg.method,
+        "throughput_images_per_sec": results,
+        "peak_gpu_mem_mb": peak_mem or None,
+        "trainable_params": trainable,
+        "total_params": total_params,
+        "trainable_params_pct": round(100.0 * trainable / max(total_params, 1), 4),
+    }

@@ -40,7 +40,17 @@ ImageNet-pretrained ViT-Base/16 backbone.
 python download_data.py --data-root ./data
 # or a subset:
 python download_data.py --data-root ./data --datasets cifar100 svhn
+# harder / less ImageNet-aligned tasks:
+python download_data.py --data-root ./data --datasets dtd fgvc_aircraft eurosat
 ```
+
+Available datasets: the four originals (`cifar100`, `flowers102`, `caltech101`,
+`svhn`) plus four harder, less-saturated tasks — `dtd` (textures, 47 classes),
+`fgvc_aircraft` (fine-grained, 100 variants), `eurosat` (satellite, 10 classes),
+and `sun397` (scenes, 397 classes; **~38 GB download**, a lighter in-genre
+alternative to Places365). The first four saturate quickly for an ImageNet-1K
+ViT-B; the harder four, especially combined with `--max-train-samples`, leave
+room for method differences to show.
 
 Each dataset lands in `./data/<dataset>/`, exactly where training expects it.
 Caltech-101 is served from Google Drive and is occasionally rate-limited — just
@@ -60,10 +70,15 @@ python main.py --method ts_paca --dataset flowers102 --num-arms 6 --select-size 
 
 # LoRA baseline on SVHN
 python main.py --method lora --dataset svhn --lora-rank 8 --lora-alpha 16
+
+# Low-data, harder task (de-saturated): TS-PaCA on FGVC-Aircraft, 1000 train imgs
+python main.py --method ts_paca --dataset fgvc_aircraft --max-train-samples 1000 \
+    --num-arms 6 --select-size 1
 ```
 
 Results (total epochs, total training time, best val accuracy, test accuracy,
-trainable-param count, and a per-epoch history with arm selections + rewards)
+trainable-param count + percentage, peak GPU memory, and a per-epoch history
+with arm selections + rewards)
 are written as JSON to `./runs/`.
 
 `scripts/run_examples.sh` runs a representative sweep.
@@ -91,7 +106,8 @@ python main.py --method ts_paca --dataset cifar100 --measure-throughput \
 | Flag | Meaning |
 |------|---------|
 | `--method` | one of `lora, paca, r_paca, ucb_paca, ts_paca, gradient_paca` |
-| `--dataset` | `cifar100, flowers102, caltech101, svhn` |
+| `--dataset` | `cifar100, flowers102, caltech101, svhn, dtd, fgvc_aircraft, eurosat, sun397` |
+| `--max-train-samples` | cap training set via class-stratified subsample (0 = all); e.g. `1000` for a VTAB-1k-style low-data regime. Val/test are untouched |
 | `--target-modules` | substrings of Linear layers to adapt (default `attn.qkv,attn.proj`) |
 | `--rank` | trainable columns per adapted layer, per arm (PaCA budget `r`) |
 | `--num-arms` | number of arms `N` |
@@ -148,6 +164,14 @@ activates the union of their columns.
 one epoch of tuning the selected arm(s). These non-stationary rewards feed the
 bandit updates.
 
+Because re-selecting an arm re-initialises `delta` to the current frozen values
+(zero correction), the model's output is unchanged at activation, so
+`A_before` for epoch *t* is exactly `A_after` from epoch *t−1*. We therefore
+evaluate the validation set **once per epoch** and reuse the previous result as
+the next epoch's baseline — one baseline evaluation at the start of a run, then
+a single evaluation per epoch. Rewards are numerically identical to computing
+`A_before` and `A_after` separately.
+
 ---
 
 ## 6. Design decisions & assumptions
@@ -177,10 +201,18 @@ correctness of the core algorithms.
 6. **Early stopping / total epochs.** The paper reports method-dependent epoch
    counts; we reproduce this via early stopping on validation accuracy
    (`--patience`) under an `--epochs` cap.
-7. **Dataset splits.** CIFAR-100 / SVHN use official splits; Flowers-102 and
-   Caltech-101 (no official train/test split of the size the paper reports) use
-   deterministic stratified 80/20 splits. A `--val-frac` hold-out is carved from
-   train for rewards and early stopping.
+7. **Dataset splits.** CIFAR-100 / SVHN / DTD / FGVC-Aircraft use official
+   splits (DTD uses partition 1, train+val pooled for training); Flowers-102,
+   Caltech-101, EuroSAT and SUN397 (no official train/test split of the needed
+   size) use deterministic stratified 80/20 splits. A `--val-frac` hold-out is
+   carved from train for rewards and early stopping, and `--max-train-samples`
+   optionally caps the *training* portion (class-stratified) while leaving the
+   validation and test sets fixed, so runs at different budgets stay comparable.
+8. **Reported metrics.** Every run logs and saves `trainable_params` (the active
+   adapter budget plus the classification head, measured before the final merge
+   so deltas are counted), its percentage of the full model, and — on CUDA —
+   `peak_gpu_mem_mb` (peak allocated memory over the run). Throughput mode also
+   reports per-batch-size peak memory.
 
 ---
 
@@ -190,7 +222,7 @@ correctness of the core algorithms.
 bandit-paca/
 ├── README.md
 ├── requirements.txt
-├── download_data.py          # downloads all four datasets to ./data/<name>
+├── download_data.py          # downloads all datasets to ./data/<name>
 ├── main.py                   # CLI entry point
 ├── scripts/
 │   └── run_examples.sh

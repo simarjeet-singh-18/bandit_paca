@@ -30,7 +30,8 @@ from src.utils import set_seed, resolve_device, save_json
 from src.data import build_datasets, build_fake_datasets, make_loaders
 from src.trainer import run, benchmark_throughput
 
-NUM_CLASSES = {"cifar100": 100, "flowers102": 102, "caltech101": 101, "svhn": 10}
+NUM_CLASSES = {"cifar100": 100, "flowers102": 102, "caltech101": 101, "svhn": 10,
+               "dtd": 47, "fgvc_aircraft": 100, "eurosat": 10, "sun397": 397}
 
 
 def main():
@@ -57,8 +58,13 @@ def main():
                                        cfg.image_size, cfg.val_frac)
     else:
         datasets = build_datasets(cfg.dataset, cfg.data_root, cfg.image_size,
-                                  cfg.val_frac, cfg.seed)
+                                  cfg.val_frac, cfg.seed, cfg.max_train_samples)
     train_ds, val_ds, test_ds, num_classes = datasets
+
+    cap = (f" (train capped at {cfg.max_train_samples}, stratified)"
+           if cfg.max_train_samples and not cfg.fake_data else "")
+    print(f"[data] {cfg.dataset}: train={len(train_ds)} val={len(val_ds)} "
+          f"test={len(test_ds)} classes={num_classes}{cap}")
 
     # ---- training ---------------------------------------------------------
     loaders = make_loaders(train_ds, val_ds, test_ds, cfg.batch_size,

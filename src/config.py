@@ -7,7 +7,8 @@ methods and their ablations can be run from a single entry point.
 import argparse
 
 METHODS = ["lora", "paca", "r_paca", "ucb_paca", "ts_paca", "gradient_paca"]
-DATASETS = ["cifar100", "flowers102", "caltech101", "svhn"]
+DATASETS = ["cifar100", "flowers102", "caltech101", "svhn",
+            "dtd", "fgvc_aircraft", "eurosat", "sun397"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,8 +22,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Fine-tuning method to run.")
     p.add_argument("--dataset", type=str, default="cifar100", choices=DATASETS,
                    help="Downstream image-classification dataset.")
-    p.add_argument("--data-root", type=str, default="/home/achyutm01/Simarjeet/bandit-paca/data",
+    p.add_argument("--data-root", type=str, default="./data",
                    help="Root folder where datasets are stored / downloaded.")
+    p.add_argument("--max-train-samples", type=int, default=0,
+                   help="If > 0, cap the number of TRAINING samples via a class-"
+                        "stratified subsample (proportional per class). The validation "
+                        "hold-out and test set are unaffected, so runs stay comparable. "
+                        "0 = use all training data. Use e.g. 1000 for a VTAB-1k-style "
+                        "low-data regime that de-saturates strong backbones.")
 
     # ---- backbone ---------------------------------------------------------
     p.add_argument("--model", type=str, default="vit_base_patch16_224",
@@ -68,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Columns owned per layer by each gradient chain (1 = paper's pure chain).")
 
     # ---- optimisation -----------------------------------------------------
-    p.add_argument("--epochs", type=int, default=100, help="Maximum number of epochs.")
+    p.add_argument("--epochs", type=int, default=30, help="Maximum number of epochs.")
     p.add_argument("--patience", type=int, default=5,
                    help="Early-stopping patience on validation accuracy (0 disables).")
     p.add_argument("--batch-size", type=int, default=64, help="Training batch size.")
