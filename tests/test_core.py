@@ -35,13 +35,18 @@ def test_thompson():
 
 def test_random_arms():
     dims = {"L0": 20, "L1": 12}
-    arms = build_random_arms(dims, num_arms=3, rank=4, rng=np.random.default_rng(1))
-    for name in dims:
+    rank = 4
+    arms = build_random_arms(dims, rank, rng=np.random.default_rng(1))
+    # exhaustive + disjoint: union of arms per layer == all columns, no overlap
+    for name, in_f in dims.items():
         seen = [c for a in arms for c in a.get(name, [])]
-        assert len(seen) == len(set(seen))  # disjoint / non-overlapping
-    assert all(len(a["L0"]) == 4 for a in arms)
+        assert sorted(seen) == list(range(in_f)), f"{name} not exhaustive/disjoint"
+    # N is derived so the partition tiles the widest layer
+    assert len(arms) == int(np.ceil(max(dims.values()) / rank))
+    # each present block is ~rank columns
+    assert all(len(a["L0"]) in (rank - 1, rank, rank + 1) for a in arms if "L0" in a)
     _ = union_arms(arms, [0, 2]); _ = arms_to_layer_dims(arms)
-    print("random arms OK")
+    print("random arms (exhaustive partition) OK")
 
 
 def test_gradient_chains():

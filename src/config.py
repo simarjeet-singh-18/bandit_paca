@@ -45,10 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- PaCA / arms ------------------------------------------------------
     p.add_argument("--rank", type=int, default=16,
-                   help="Number of trainable columns (input neurons) per adapted layer, "
-                        "per arm. This is the PaCA budget r.")
+                   help="Trainable columns (input neurons) updated per arm, per "
+                        "adapted layer -- the PaCA budget r. For ucb_paca/ts_paca "
+                        "this also fixes the number of random arms, since the arms "
+                        "exhaustively partition each layer: N = ceil(in_features / rank).")
     p.add_argument("--num-arms", type=int, default=6,
-                   help="Number of arms N in the multi-armed-bandit formulation.")
+                   help="Number of arms N. Used ONLY by gradient_paca (the number "
+                        "of gradient-aligned chains, per the paper's N/K ablation). "
+                        "For ucb_paca/ts_paca the random arms form an exhaustive "
+                        "partition, so N is derived from --rank and this flag is ignored.")
     p.add_argument("--select-size", type=int, default=1,
                    help="Number of arms K selected per epoch. UCB defaults to 1.")
 

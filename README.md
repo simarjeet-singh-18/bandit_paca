@@ -17,8 +17,8 @@ This repository implements every method the paper compares:
 | `lora`            | — (low-rank adapters)             | —                    |
 | `paca`            | one fixed random column subset    | fixed                |
 | `r_paca`          | new random subset each epoch      | random / epoch       |
-| `ucb_paca`        | random, disjoint arms             | UCB                  |
-| `ts_paca`         | random, disjoint arms             | Thompson Sampling    |
+| `ucb_paca`        | random exhaustive-partition arms  | UCB                  |
+| `ts_paca`         | random exhaustive-partition arms  | Thompson Sampling    |
 | `gradient_paca`   | gradient-aligned chains           | Thompson Sampling    |
 
 ---
@@ -63,17 +63,17 @@ re-run the script if it fails.
 python main.py --method gradient_paca --dataset cifar100 --num-arms 3 --select-size 1
 
 # UCB-PaCA on Caltech-101
-python main.py --method ucb_paca --dataset caltech101 --rank 16 --num-arms 6 --ucb-alpha 1.0
+python main.py --method ucb_paca --dataset caltech101 --rank 16 --ucb-alpha 1.0
 
-# TS-PaCA on Flowers-102 selecting K=2 arms per epoch
-python main.py --method ts_paca --dataset flowers102 --num-arms 6 --select-size 2
+# TS-PaCA on Flowers-102 selecting K=2 arms per epoch (N derived from --rank)
+python main.py --method ts_paca --dataset flowers102 --rank 16 --select-size 2
 
 # LoRA baseline on SVHN
 python main.py --method lora --dataset svhn --lora-rank 8 --lora-alpha 16
 
 # Low-data, harder task (de-saturated): TS-PaCA on FGVC-Aircraft, 1000 train imgs
 python main.py --method ts_paca --dataset fgvc_aircraft --max-train-samples 1000 \
-    --num-arms 6 --select-size 1
+    --rank 16 --select-size 1
 ```
 
 Results (total epochs, total training time, best val accuracy, test accuracy,
@@ -109,9 +109,9 @@ python main.py --method ts_paca --dataset cifar100 --measure-throughput \
 | `--dataset` | `cifar100, flowers102, caltech101, svhn, dtd, fgvc_aircraft, eurosat, sun397` |
 | `--max-train-samples` | cap training set via class-stratified subsample (0 = all); e.g. `1000` for a VTAB-1k-style low-data regime. Val/test are untouched |
 | `--target-modules` | substrings of Linear layers to adapt (default `attn.qkv,attn.proj`) |
-| `--rank` | trainable columns per adapted layer, per arm (PaCA budget `r`) |
-| `--num-arms` | number of arms `N` |
-| `--select-size` | arms selected per epoch `K` (UCB defaults to 1) |
+| `--rank` | columns updated per arm, per layer (PaCA budget `r`); for ucb/ts also fixes `N = ceil(in_features/rank)` |
+| `--num-arms` | number of arms `N` — used only by `gradient_paca` (chain count); derived from `--rank` for ucb/ts |
+| `--select-size` | arms selected per epoch `K` (paper default 1) |
 | `--ucb-alpha` | UCB exploration coefficient `α` |
 | `--ts-mu0 / --ts-sigma0 / --ts-sigma-obs` | Gaussian TS prior / noise |
 | `--warmup-epochs` | warm start before sensitivity analysis (gradient method) |
@@ -142,9 +142,13 @@ active set changes between epochs the trained columns are merged back into `W`
 so learning persists.
 
 **MAB formulation (Sec. 4.1).** An arm is `{layer_name: [column indices]}`.
-Random arms (`src/bandit/arms.py`) partition each layer's columns into `N`
-disjoint groups (empty pairwise intersection, as required). Selecting arms
-activates the union of their columns.
+Random arms (`src/bandit/arms.py`) form an **exhaustive, disjoint partition** of
+every adapted layer's columns: the union of all arms is the full column set and
+any two arms are non-overlapping, exactly as the paper requires. Each arm owns
+`--rank` columns per layer, so the number of arms is *derived*,
+`N = ceil(in_features / rank)` (e.g. 768 columns at rank 16 → 48 arms). Selecting
+arms activates the union of their columns; one arm updates `rank` columns per
+layer, matching PaCA's budget.
 
 **Sensitivity & chains (`src/sensitivity.py`).**
 - Proxy loss (Eq. 4): `L_proxy = mean(logits)` — label-agnostic.
@@ -183,13 +187,25 @@ correctness of the core algorithms.
 1. **Classification head** is always trained (a fresh `Linear` for the new label
    space); pass `--freeze-head` to disable. Adapter arms control the *backbone*
    column selection.
-2. **Random arm width.** Each random arm owns exactly `--rank` columns per
-   layer, and arms are disjoint per layer (`N·rank ≤ in_features`). This keeps
-   each arm's per-epoch budget equal to PaCA's while satisfying the paper's
-   non-overlap requirement.
-3. **Gradient chains across heterogeneous layers.** Adapted layers need not have
-   matching dimensions (e.g. `qkv` has `out=3·in`), so the propagated output
-   index `i*` is mapped into the next layer's input range modulo its width.
+2. **Random arms exhaustively partition the weights.** Per Sec. 4.1 the arms
+   tile every adapted layer: their union is all columns and they are pairwise
+   disjoint. Each arm holds `--rank` columns, so the arm count is derived,
+   `N = ceil(in_features / rank)`, and `--num-arms` is ignored for `ucb_paca` /
+   `ts_paca` (it only sets the number of gradient chains for `gradient_paca`).
+   Sweeping `--rank` reproduces the paper's rank ablation (rank 8/16/32/48 →
+   N = 96/48/24/16 on a 768-wide layer).
+3. **Gradient chains across ViT layers (an interpretation point).** The paper's
+   chain assumes each layer's output index directly indexes the next layer's
+   input (a true architectural path, as in an MLP where `out_l = in_{l+1}`). In a
+   ViT, the adapted attention Linears are not directly wired (`qkv` has
+   `out = 3·in`, and attention sits between `qkv` and `proj`), so a literal chain
+   is undefined. We keep the algorithm well-defined by mapping the propagated
+   index `i*` into the next adapted layer's input range modulo its width. This is
+   the one place the paper's construction does not map cleanly onto ViT attention
+   sublayers; adapting a stack of equal-width layers (e.g. only `attn.proj`
+   across blocks, or the MLP `fc` layers) yields architecturally cleaner chains.
+   Chain *start* indices are the most column-sensitive inputs of the first
+   adapted layer (the paper requires only that the `K` starts be distinct).
    `--chain-width > 1` broadens each chain with the next most column-sensitive
    inputs (an optional extension; `1` reproduces the paper's pure chains).
 4. **Gradient warm start** tunes a broad random adapter set (`rank·num_arms`

@@ -257,16 +257,26 @@ def _dispatch_r_paca(cfg, model, manager, train_loader, val_loader,
 def _dispatch_random_bandit(cfg, model, manager, train_loader, val_loader,
                             device, criterion, scaler, history, logger):
     rng = np.random.default_rng(cfg.seed)
-    arms = build_random_arms(manager.layer_in_features(), cfg.num_arms, cfg.rank, rng)
+    # Paper Sec 4.1: the random arms exhaustively and disjointly partition ALL
+    # adapted columns. Each arm holds ~`rank` columns, so N is derived here
+    # (ceil(in_features / rank)) rather than taken from --num-arms.
+    arms = build_random_arms(manager.layer_in_features(), cfg.rank, rng)
+    num_arms = len(arms)
+    select_size = max(1, min(cfg.select_size, num_arms))
+
+    if cfg.num_arms != num_arms:
+        logger(f"[arms] --num-arms is not used for {cfg.method}: random arms form "
+               f"an exhaustive partition, so N is set by --rank.")
+    logger(f"[arms] {cfg.method}: N={num_arms} exhaustive disjoint arms "
+           f"(~{cfg.rank} cols/arm/layer), K={select_size} selected/epoch; "
+           f"union = all adapted columns.")
 
     if cfg.method == "ucb_paca":
-        bandit = UCB(cfg.num_arms, alpha=cfg.ucb_alpha)
-        select_size = cfg.select_size
+        bandit = UCB(num_arms, alpha=cfg.ucb_alpha)
     else:  # ts_paca
         bandit = GaussianThompsonSampling(
-            cfg.num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
+            num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
             sigma_obs=cfg.ts_sigma_obs, rng=np.random.default_rng(cfg.seed + 1))
-        select_size = cfg.select_size
 
     _bandit_loop(cfg, model, manager, arms, bandit, select_size,
                  train_loader, val_loader, device, criterion, scaler, history, logger)
@@ -296,13 +306,16 @@ def _dispatch_gradient_paca(cfg, model, manager, train_loader, val_loader,
                                num_batches=cfg.sens_batches)
     layer_order = manager.layer_names  # depth order preserved during wrapping
     arms = build_gradient_chains(sens, layer_order, cfg.num_arms, cfg.chain_width)
-    logger(f"[gradient] built {len(arms)} gradient-aligned chain arms.")
+    num_arms = len(arms)
+    select_size = max(1, min(cfg.select_size, num_arms))
+    logger(f"[gradient] built {num_arms} gradient-aligned chain arms "
+           f"(N={num_arms}, K={select_size}).")
 
     # ---- Thompson Sampling over chain arms (paper reports TS for gradient) ---
     bandit = GaussianThompsonSampling(
-        cfg.num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
+        num_arms, mu0=cfg.ts_mu0, sigma0=cfg.ts_sigma0,
         sigma_obs=cfg.ts_sigma_obs, rng=np.random.default_rng(cfg.seed + 2))
-    _bandit_loop(cfg, model, manager, arms, bandit, cfg.select_size,
+    _bandit_loop(cfg, model, manager, arms, bandit, select_size,
                  train_loader, val_loader, device, criterion, scaler, history, logger,
                  start_epoch=cfg.warmup_epochs)
 
